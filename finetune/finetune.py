@@ -17,7 +17,7 @@ from transformers.integrations import deepspeed
 from transformers import AutoModel, AutoTokenizer
 
 from dataset import SupervisedDataset, data_collator
-from trainer import CPMTrainer
+from trainer_takeda import CPMTrainer
 
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 

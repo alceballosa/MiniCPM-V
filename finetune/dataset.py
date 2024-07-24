@@ -3,6 +3,7 @@ import json
 import logging
 import math
 import os
+import pdb
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -14,6 +15,7 @@ from torch.utils.data import Dataset
 from transformers import AutoProcessor, AutoTokenizer
 
 llama3_chat_template = "{% set loop_messages = messages %}{% for message in loop_messages %}{% set content = '<|start_header_id|>' + message['role'] + '<|end_header_id|>\n\n'+ message['content'] | trim + '<|eot_id|>' %}{% if loop.index0 == 0 %}{% set content = bos_token + content %}{% endif %}{{ content }}{% endfor %}"
+
 
 class SupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
@@ -36,7 +38,7 @@ class SupervisedDataset(Dataset):
         self.slice_config = slice_config
         self.llm_type = llm_type
         self.patch_size = patch_size
-        self.query_nums=query_nums
+        self.query_nums = query_nums
         self.batch_vision = batch_vision
 
     def __len__(self):
@@ -55,6 +57,7 @@ class SupervisedDataset(Dataset):
             patch_size=self.patch_size,
             batch_vision=self.batch_vision,
         )
+
         ret = dict(
             input_ids=ret["input_ids"],
             position_ids=ret["position_ids"],
@@ -63,19 +66,24 @@ class SupervisedDataset(Dataset):
             pixel_values=ret["pixel_values"],
             tgt_sizes=ret["tgt_sizes"],
             image_bound=ret["image_bound"],
+            penalty_ids=ret["penalty_ids"],
         )
 
         return ret
 
+
 def data_collator(examples, padding_value=0, max_length=2048):
     def trim_and_pad(seq, batch_first, padding_value):
-        return pad_sequence([s[:max_length] for s in seq], batch_first=True, padding_value=padding_value)
+        return pad_sequence(
+            [s[:max_length] for s in seq], batch_first=True, padding_value=padding_value
+        )
 
     input_ids = trim_and_pad(
         [example["input_ids"] for example in examples],
         batch_first=True,
         padding_value=padding_value,
     )
+
     position_ids = trim_and_pad(
         [example["position_ids"] for example in examples],
         batch_first=True,
@@ -86,6 +94,11 @@ def data_collator(examples, padding_value=0, max_length=2048):
         batch_first=True,
         padding_value=-100,
     )
+    penalty_ids = trim_and_pad(
+        [example["penalty_ids"] for example in examples],
+        batch_first=True,
+        padding_value=padding_value,
+    )
     attention_mask = trim_and_pad(
         [example["attention_mask"] for example in examples],
         batch_first=True,
@@ -94,6 +107,7 @@ def data_collator(examples, padding_value=0, max_length=2048):
     pixel_values = [example["pixel_values"] for example in examples]
     image_bound = [example["image_bound"] for example in examples]
     tgt_sizes = [example["tgt_sizes"] for example in examples]
+
     return {
         "input_ids": input_ids,
         "position_ids": position_ids,
@@ -102,6 +116,7 @@ def data_collator(examples, padding_value=0, max_length=2048):
         "image_bound": image_bound,
         "tgt_sizes": tgt_sizes,
         "pixel_values": pixel_values,
+        "penalty_ids": penalty_ids,
     }
 
 
@@ -112,7 +127,7 @@ def conversation_to_ids(conversation, tokenizer, llm_type=None):
                    {'role': 'assistant', 'content': 'This is a cat.'}]
     """
     if llm_type == "llama3":
-        input_ids, context, raw_msg = conversation_to_ids_llama3(
+        input_ids, context, penalty_ids, raw_msg = conversation_to_ids_llama3(
             conversation, tokenizer
         )
     else:
@@ -122,6 +137,7 @@ def conversation_to_ids(conversation, tokenizer, llm_type=None):
 
     ids = torch.from_numpy(np.hstack(input_ids, dtype=np.int32))
     context = torch.from_numpy(np.hstack(context, dtype=np.int8))
+    penalty_ids = torch.from_numpy(np.hstack(penalty_ids, dtype=np.int8))
 
     # build target
     target = torch.full_like(ids, -100, dtype=torch.int32)
@@ -140,7 +156,7 @@ def conversation_to_ids(conversation, tokenizer, llm_type=None):
     image_end_tokens = torch.where(ids == tokenizer.im_end_id)[0]
     if len(image_start_tokens) != len(image_end_tokens):
         print("image start token != image end tokens")
-        
+
     if len(image_start_tokens) > 0:
         image_bound = torch.hstack(
             [image_start_tokens.unsqueeze(-1), image_end_tokens.unsqueeze(-1)]
@@ -149,12 +165,14 @@ def conversation_to_ids(conversation, tokenizer, llm_type=None):
         image_bound = []
 
     position_ids = torch.arange(ids.size(0)).long()
+
     return {
         "input_ids": ids,
         "target": target,
         "image_bound": image_bound,
         "raw_msg": raw_msg,
-        "position_ids": position_ids
+        "position_ids": position_ids,
+        "penalty_ids": penalty_ids,
     }
 
 
@@ -190,17 +208,79 @@ def conversation_to_ids_minicpm(conversation, tokenizer):
     return input_ids, context, raw_msg
 
 
+def get_spans_of_field_substrings(raw_msg: str) -> list:
+    """
+    Given a raw msg which contains some text and additional JSON formatted data, get
+    a list of character spans for all substrings that are within the field "datapoints".
+
+    Args:
+        raw_msg: string containing text and additional JSON formatted data.
+    """
+
+    spans = []
+    start_idx = raw_msg.find('"datapoints":')
+    if start_idx == -1:
+        return spans
+    while start_idx < len(raw_msg):
+        start_idx = raw_msg.find('"', start_idx)
+        end_idx = raw_msg.find('"', start_idx + 1)
+        if end_idx == -1:
+            break
+
+        spans.append((start_idx + 1, end_idx))
+        start_idx = end_idx + 1
+
+    # filter out spans that are not valid numeric strings
+    spans = [
+        span
+        for span in spans
+        if raw_msg[span[0] : span[1]].replace(".", "", 1).isdigit()
+    ]
+
+    return spans
+
+
 def conversation_to_ids_llama3(conversation, tokenizer):
     raw_msg = ""
     input_ids = []
     context = []
+
     raw_msg = tokenizer.apply_chat_template(
-        conversation, tokenize=False, add_generation_prompt=False, chat_template=llama3_chat_template,
+        conversation,
+        tokenize=False,
+        add_generation_prompt=False,
+        chat_template=llama3_chat_template,
     )
-    input_ids = tokenizer.apply_chat_template(
-        conversation, tokenize=True, add_generation_prompt=False, chat_template=llama3_chat_template,
-    )
+    # input_ids = tokenizer.apply_chat_template(
+    #     conversation,
+    #     tokenize=True,
+    #     add_generation_prompt=False,
+    #     chat_template=llama3_chat_template,
+    # )
+
+    text_encoding = tokenizer.encode_plus(raw_msg)
+
+    input_ids = text_encoding["input_ids"]
+
+    char_to_token_mapping = [
+        text_encoding.char_to_token(i) for i in range(len(raw_msg))
+    ]
+
+    spans = get_spans_of_field_substrings(raw_msg)
+
+    numeric_tokens = []
+    for span in spans:
+        start_char, end_char = span
+        start_token = char_to_token_mapping[start_char]
+        end_token = char_to_token_mapping[end_char]
+        numeric_tokens.extend(list(range(start_token, end_token)))
+
+    numeric_token_penalty_ids = [
+        1 if i in numeric_tokens else 0 for i in range(len(input_ids))
+    ]
+
     input_ids = np.array(input_ids)
+    numeric_token_penalty_ids = np.array(numeric_token_penalty_ids)
 
     start_header_idxs = np.where(
         input_ids == tokenizer.convert_tokens_to_ids("<|start_header_id|>")
@@ -211,8 +291,7 @@ def conversation_to_ids_llama3(conversation, tokenizer):
     end_header_idxs = np.where(
         input_ids == tokenizer.convert_tokens_to_ids("<|end_header_id|>")
     )[0]
-    eot_idxs = np.where(
-        input_ids == tokenizer.convert_tokens_to_ids("<|eot_id|>"))[0]
+    eot_idxs = np.where(input_ids == tokenizer.convert_tokens_to_ids("<|eot_id|>"))[0]
 
     context = np.ones_like(input_ids, dtype=np.int8)
 
@@ -221,13 +300,14 @@ def conversation_to_ids_llama3(conversation, tokenizer):
             st = assistant_idx + 3  # assistant<|end_header_id|>\n\n
             for eot_idx in eot_idxs:
                 if eot_idx > st:
-                    context[st: eot_idx + 1] = 0
+                    context[st : eot_idx + 1] = 0
                     break
 
     input_ids = np.hstack(input_ids)
     context = np.hstack(context)
+    numeric_token_penalty_ids = np.hstack(numeric_token_penalty_ids)
 
-    return input_ids, context, raw_msg
+    return input_ids, context, numeric_token_penalty_ids, raw_msg
 
 
 def preprocess(
@@ -271,8 +351,7 @@ def preprocess(
                 for j in range(len(patches[0])):
                     images.append(patches[i][j])
 
-            image_placeholder += get_grid_placeholder(
-                tokenizer, best_grid, query_nums)
+            image_placeholder += get_grid_placeholder(tokenizer, best_grid, query_nums)
         images = [transform(i) for i in images]
     else:
         images = [transform(image)]
@@ -315,8 +394,7 @@ def slice_image(
     original_size = image.size
     original_width, original_height = original_size
     log_ratio = math.log(original_width / original_height)
-    ratio = original_width * original_height / \
-        (scale_resolution * scale_resolution)
+    ratio = original_width * original_height / (scale_resolution * scale_resolution)
     multiple = min(math.ceil(ratio), max_slice_nums)
 
     source_image = None
@@ -337,8 +415,7 @@ def slice_image(
             candidate_split_grids_nums.append(i)
 
         # source image, down-sampling and ensure divided by patch_size
-        best_resize = find_best_resize(
-            original_size, scale_resolution, patch_size)
+        best_resize = find_best_resize(original_size, scale_resolution, patch_size)
         source_image = image.copy().resize(best_resize, Image.Resampling.BICUBIC)
         candidate_grids = []
 
@@ -437,8 +514,7 @@ def get_grid_placeholder(tokenizer, grid, query_num):
         for j in range(cols):
             lines.append(image_placeholder)
         slices.append("".join(lines))
-    slice_placeholder = tokenizer.slice_start + \
-        "\n".join(slices) + tokenizer.slice_end
+    slice_placeholder = tokenizer.slice_start + "\n".join(slices) + tokenizer.slice_end
     return slice_placeholder
 
 
@@ -453,6 +529,5 @@ def reshape_by_patch(image_tensor, patch_size):
     )
 
     patches = patches.reshape(image_tensor.size(0), patch_size, patch_size, -1)
-    patches = patches.permute(0, 1, 3, 2).reshape(
-        image_tensor.size(0), patch_size, -1)
+    patches = patches.permute(0, 1, 3, 2).reshape(image_tensor.size(0), patch_size, -1)
     return patches

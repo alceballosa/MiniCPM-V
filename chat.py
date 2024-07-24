@@ -161,8 +161,12 @@ class MiniCPMV:
         return answer
 
 class MiniCPMV2_5:
-    def __init__(self, model_path) -> None:
-        self.model = AutoModel.from_pretrained(model_path, trust_remote_code=True).to(dtype=torch.float16)
+    def __init__(self, model_path, model=None) -> None:
+        
+        if model is not None:
+            self.model = model
+        else: 
+            self.model = AutoModel.from_pretrained(model_path, trust_remote_code=True).to(dtype=torch.float16)
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         self.model.eval().cuda()
 
@@ -185,13 +189,16 @@ class MiniCPMV2_5:
 
 
 class MiniCPMVChat:
-    def __init__(self, model_path) -> None:
-        if '12B' in model_path:
-            self.model = OmniLMM12B(model_path)
-        elif 'MiniCPM-Llama3-V' in model_path:
-            self.model = MiniCPMV2_5(model_path)
+    def __init__(self, model_path, model = None) -> None:
+        if model is not None:
+            self.model = MiniCPMV2_5(model_path, model)
         else:
-            self.model = MiniCPMV(model_path)
+            if '12B' in model_path:
+                self.model = OmniLMM12B(model_path)
+            elif 'MiniCPM-Llama3-V' in model_path:
+                self.model = MiniCPMV2_5(model_path)
+            else:
+                self.model = MiniCPMV(model_path)
 
     def chat(self, input):
         return self.model.chat(input)
