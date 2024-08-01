@@ -40,8 +40,8 @@ torchrun $DISTRIBUTED_ARGS finetune.py  \
     --max_slice_nums 9 \
     --max_steps 20000 \
     --eval_steps 1000 \
-    --output_dir output/minicpmv2_data23 \
-    --logging_dir output/minicpmv2_data23 \
+    --output_dir output/minicpmv2_data28 \
+    --logging_dir output/minicpmv2_data28 \
     --logging_strategy "steps" \
     --per_device_train_batch_size 2 \
     --per_device_eval_batch_size 2 \
@@ -51,7 +51,9 @@ torchrun $DISTRIBUTED_ARGS finetune.py  \
     --save_steps 1000 \
     --use_lora true \
     --q_lora true \
-    --save_total_limit 10 \
+    --lora_r 64 \
+    --lora_alpha 16 \
+    --save_total_limit 21 \
     --learning_rate 1e-6 \
     --weight_decay 0.1 \
     --adam_beta2 0.95 \

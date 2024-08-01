@@ -23,7 +23,7 @@ def apply_loss_penalties(penalty_ids, weight=1):
 class CPMTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False):
 
-        weight = 10
+        weight = 1
 
         if "labels" in inputs:
             labels = inputs.pop("labels")

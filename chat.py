@@ -98,7 +98,7 @@ class OmniLMM12B:
                 input_ids=input_ids.unsqueeze(0).cuda(),
                 images=image.unsqueeze(0).half().cuda(),
                 temperature=0.6,
-                max_new_tokens=1024,
+                max_new_tokens=1024+512,
                 # num_beams=num_beams,
                 do_sample=True,
                 output_scores=True,
@@ -182,8 +182,8 @@ class MiniCPMV2_5:
             image=image,
             msgs=msgs,
             tokenizer=self.tokenizer,
-            sampling=True,
-            temperature=0.7
+            sampling=False,
+            #temperature=0.0
     	)
         return answer
 
