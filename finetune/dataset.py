@@ -120,7 +120,7 @@ def data_collator(examples, padding_value=0, max_length=2048):
     }
 
 
-def conversation_to_ids(conversation, tokenizer, llm_type=None):
+def conversation_to_ids(conversation, tokenizer, llm_type=None, new_schema=False):
     """
     for single image multi-turn conversation
     conversation: [{'role': 'user', 'content': 'Describe this image'},
@@ -130,6 +130,8 @@ def conversation_to_ids(conversation, tokenizer, llm_type=None):
         input_ids, context, penalty_ids, raw_msg = conversation_to_ids_llama3(
             conversation, tokenizer
         )
+    elif llm_type == "qwen2":
+        input_ids, context, raw_msg = conversation_to_ids_qwen2(conversation, tokenizer)
     else:
         input_ids, context, raw_msg = conversation_to_ids_minicpm(
             conversation, tokenizer
@@ -141,6 +143,7 @@ def conversation_to_ids(conversation, tokenizer, llm_type=None):
 
     # build target
     target = torch.full_like(ids, -100, dtype=torch.int32)
+
     for i in range(1, len(ids)):
         if context[i] == 0:
             target[i - 1] = ids[i]
@@ -151,12 +154,18 @@ def conversation_to_ids(conversation, tokenizer, llm_type=None):
                 target[i - 1] = tokenizer.eos_id
 
     # build image bound
-    image_start_tokens = torch.where(ids == tokenizer.im_start_id)[0]
-    image_start_tokens += 1
-    image_end_tokens = torch.where(ids == tokenizer.im_end_id)[0]
+    if new_schema:
+        start_cond = (ids == tokenizer.im_start_id) | (ids == tokenizer.slice_start_id)
+        end_cond = (ids == tokenizer.im_end_id) | (ids == tokenizer.slice_end_id)
+        image_start_tokens = torch.where(start_cond)[0]
+        image_start_tokens += 1
+        image_end_tokens = torch.where(end_cond)[0]
+    else:
+        image_start_tokens = torch.where(ids == tokenizer.im_start_id)[0]
+        image_start_tokens += 1
+        image_end_tokens = torch.where(ids == tokenizer.im_end_id)[0]
     if len(image_start_tokens) != len(image_end_tokens):
         print("image start token != image end tokens")
-
     if len(image_start_tokens) > 0:
         image_bound = torch.hstack(
             [image_start_tokens.unsqueeze(-1), image_end_tokens.unsqueeze(-1)]
@@ -310,6 +319,53 @@ def conversation_to_ids_llama3(conversation, tokenizer):
     return input_ids, context, numeric_token_penalty_ids, raw_msg
 
 
+def conversation_to_ids_qwen2(conversation, tokenizer):
+    raw_msg = ""
+    chat = []
+    context = []
+    for idx, msg in enumerate(conversation):
+        role = msg["role"]
+        message = msg["content"]
+        assert role in ["user", "assistant"]
+        if role == "user":
+            prefix = "user"
+        else:
+            prefix = "assistant"
+        chat.append({"role": prefix, "content": message})
+        raw_msg += prefix + message
+    assert set([i["role"] for i in chat]) & set(["assistant"])
+
+    ret = tokenizer.apply_chat_template(
+        chat, tokenize=False, add_generation_prompt=False
+    )
+    input_ids = tokenizer.apply_chat_template(
+        chat, tokenize=True, add_generation_prompt=False
+    )
+    input_ids = np.array(input_ids)
+
+    start_idxs = np.where(input_ids == tokenizer.convert_tokens_to_ids("<|im_start|>"))[
+        0
+    ]
+    assistant_idxs = np.where(
+        input_ids == tokenizer.convert_tokens_to_ids("assistant")
+    )[0]
+    end_idxs = np.where(input_ids == tokenizer.convert_tokens_to_ids("<|im_end|>"))[0]
+
+    context = np.ones_like(input_ids, dtype=np.int8)
+
+    for assistant_idx in assistant_idxs:
+        if assistant_idx - 1 in set(start_idxs):
+            st = assistant_idx + 1
+            for end_idx in end_idxs:
+                if end_idx > st:
+                    context[st : end_idx + 1] = 0
+                    break
+
+    input_ids = np.hstack(input_ids)
+    context = np.hstack(context)
+    return input_ids, context, raw_msg
+
+
 def preprocess(
     image,
     conversation,
@@ -336,8 +392,14 @@ def preprocess(
     default_image_placeholder = (
         tokenizer.im_start + tokenizer.unk_token * query_nums + tokenizer.im_end
     )
+    new_schema = False
+    use_image_id = False
+    if llm_type == "qwen2":
+        new_schema = True
+        use_image_id = True
     if slice_config:
         images = []
+        image_id_cnt = 0
         source_image, patches, best_grid = slice_image(
             image,
             slice_config["max_slice_nums"],
@@ -350,8 +412,15 @@ def preprocess(
             for i in range(len(patches)):
                 for j in range(len(patches[0])):
                     images.append(patches[i][j])
-
-            image_placeholder += get_grid_placeholder(tokenizer, best_grid, query_nums)
+            if use_image_id:
+                image_placeholder = (
+                    f"{tokenizer.im_id_start}{image_id_cnt}{tokenizer.im_id_end}"
+                    + image_placeholder
+                )
+                image_id_cnt += 1
+            image_placeholder += get_grid_placeholder(
+                tokenizer, best_grid, query_nums, new_schema=new_schema
+            )
         images = [transform(i) for i in images]
     else:
         images = [transform(image)]
@@ -365,7 +434,7 @@ def preprocess(
             image_placeholder + "\n" + conversation[0]["content"]
         )
 
-    input_dict = conversation_to_ids(conversation, tokenizer, llm_type)
+    input_dict = conversation_to_ids(conversation, tokenizer, llm_type, new_schema)
 
     if batch_vision:
         tgt_sizes = []
@@ -501,7 +570,7 @@ def split_to_patches(image, grid):
     return patches
 
 
-def get_grid_placeholder(tokenizer, grid, query_num):
+def get_grid_placeholder(tokenizer, grid, query_num, new_schema=False):
     image_placeholder = (
         tokenizer.im_start + tokenizer.unk_token * query_num + tokenizer.im_end
     )
@@ -514,7 +583,12 @@ def get_grid_placeholder(tokenizer, grid, query_num):
         for j in range(cols):
             lines.append(image_placeholder)
         slices.append("".join(lines))
-    slice_placeholder = tokenizer.slice_start + "\n".join(slices) + tokenizer.slice_end
+    if new_schema:
+        slice_placeholder = "\n".join(slices)
+    else:
+        slice_placeholder = (
+            tokenizer.slice_start + "\n".join(slices) + tokenizer.slice_end
+        )
     return slice_placeholder
 
 
